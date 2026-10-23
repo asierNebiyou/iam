@@ -4,7 +4,9 @@ from urllib.parse import urlparse
 
 import httpx
 from authlib.integrations.httpx_client import AsyncOAuth2Client
+from authlib.jose import JsonWebEncryption, JsonWebKey
 from authlib.oauth2.rfc7636 import create_s256_code_challenge
+from jose import jwt as jose_jwt
 from openg2p_fastapi_common.errors.http_exceptions import InternalServerError, UnauthorizedError
 
 from iam_core.context import server_metadata_cache
@@ -24,6 +26,78 @@ from .helpers.token_helper import validate_refresh_token_response
 
 _config = Settings.get_config(strict=False)
 _logger = logging.getLogger(_config.logging_default_logger_name)
+
+
+def decode_userinfo_jwt(token: str, client_private_key: bytes | str | None = None) -> dict:
+    """Decode eSignet userinfo JWT.
+
+    MOSIP-style IdPs often return an encrypted JWT (JWE, 5 segments) whose
+    payload is a signed JWT (JWS) with claims such as ``individual_id``.
+    Plain JWS (3 segments) is also supported (claims read without verify —
+    callers that need signature checks should use ``verify_signed_jwt``).
+    """
+    token = (token or "").strip()
+    if not token:
+        return {}
+
+    payload = token
+    if token.count(".") == 4:
+        if not client_private_key:
+            raise InternalServerError(
+                "G2P-AUT-503",
+                "Encrypted userinfo JWT requires client_private_key to decrypt.",
+            )
+        key_material = client_private_key
+        if isinstance(key_material, str):
+            key_material = key_material.encode("utf-8")
+        key = JsonWebKey.import_key(key_material, {"kty": "RSA"})
+        decrypted = JsonWebEncryption().deserialize(token, key)
+        inner = decrypted.get("payload")
+        if isinstance(inner, bytes):
+            inner = inner.decode("utf-8")
+        payload = inner
+
+    if isinstance(payload, (bytes, bytearray)):
+        payload = payload.decode("utf-8")
+
+    if isinstance(payload, str) and payload.count(".") == 2:
+        return jose_jwt.get_unverified_claims(payload)
+
+    if isinstance(payload, str):
+        return json.loads(payload)
+
+    if isinstance(payload, dict):
+        return payload
+
+    raise InternalServerError(
+        "G2P-AUT-502",
+        "Unsupported userinfo JWT payload after decrypt.",
+    )
+
+
+def _decrypt_userinfo_jwe_if_needed(
+    token: str, client_private_key: bytes | str | None
+) -> str:
+    """If token is a JWE, decrypt with the client private key; else return as-is."""
+    token = (token or "").strip()
+    if token.count(".") != 4:
+        return token
+    if not client_private_key:
+        raise InternalServerError(
+            "G2P-AUT-503",
+            "Encrypted userinfo JWT requires client_private_key to decrypt.",
+        )
+    key_material = client_private_key
+    if isinstance(key_material, str):
+        key_material = key_material.encode("utf-8")
+    key = JsonWebKey.import_key(key_material, {"kty": "RSA"})
+    decrypted = JsonWebEncryption().deserialize(token, key)
+    inner = decrypted.get("payload")
+    if isinstance(inner, bytes):
+        inner = inner.decode("utf-8")
+    if isinstance(inner, dict):
+        return json.dumps(inner)
+    return str(inner)
 
 
 class OidcClient:
@@ -292,13 +366,26 @@ class OidcClient:
             content_type = response.headers.get("content-type", "")
             if content_type.startswith("application/json"):
                 return response.json()
-            if content_type.startswith("application/jwt"):
-                # A signed userinfo is only worth more than plain JSON if the
-                # signature is checked. Verify it against the same published keys
-                # as the ID token; callers bind identity to these claims.
-                issuer = metadata.get("issuer") or self._guess_issuer(login_provider)
-                jwks = await jwks_get(metadata, issuer)
-                return verify_signed_jwt(response.text, jwks)
+
+            body = (response.text or "").strip()
+            # application/jwt, or gateways that omit content-type but return JWT/JWE.
+            if content_type.startswith("application/jwt") or body.count(".") in (2, 4):
+                # MOSIP-style eSignet often returns an encrypted JWT (JWE). Decrypt first,
+                # then verify the inner signed JWT when present.
+                token = _decrypt_userinfo_jwe_if_needed(
+                    body,
+                    getattr(login_provider, "client_private_key", None),
+                )
+                if isinstance(token, str) and token.count(".") == 2:
+                    issuer = metadata.get("issuer") or self._guess_issuer(login_provider)
+                    jwks = await jwks_get(metadata, issuer)
+                    return verify_signed_jwt(token, jwks)
+                if isinstance(token, str) and token.startswith("{"):
+                    return json.loads(token)
+                return decode_userinfo_jwt(
+                    body,
+                    getattr(login_provider, "client_private_key", None),
+                )
             return {}
 
     async def introspect_token(
